@@ -4,6 +4,7 @@ import multer from 'multer'
 import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
 import { ingestDocument } from './getdocfile.js'
+import { handleChat } from './chat.js'
 
 const app = express()
 const port = process.env.PORT || 3000
@@ -11,13 +12,11 @@ const port = process.env.PORT || 3000
 // ── Lazy Supabase client ──────────────────────────────────────────────────────
 let _supabase = null
 function getSupabase() {
-  if (!_supabase) {
-    _supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
-  }
+  if (!_supabase) _supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
   return _supabase
 }
 
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:8080' }))
+app.use(cors())
 app.use(express.json())
 
 const upload = multer({
@@ -30,15 +29,19 @@ const upload = multer({
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /  — health check
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.json({ status: 'ok' }))
 
-// ── GET /documents — list files from Lesson_Files bucket ─────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /documents  — list raw files from Lesson_Files bucket
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/documents', async (_req, res) => {
   try {
     const supabase = getSupabase()
     const { data, error } = await supabase
-      .storage
-      .from('Lesson_Files')
+      .storage.from('Lesson_Files')
       .list('', { sortBy: { column: 'created_at', order: 'desc' } })
 
     if (error) return res.status(500).json({ error: error.message })
@@ -58,7 +61,9 @@ app.get('/documents', async (_req, res) => {
   }
 })
 
-// ── POST /documents/upload ────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /documents/upload  — upload + ingest a document
+// ─────────────────────────────────────────────────────────────────────────────
 app.post('/documents/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file received.' })
@@ -71,7 +76,6 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
 
     console.log(`[upload] Received: ${fileName}`)
 
-    // Step 1: Save raw file to Lesson_Files bucket
     const { error: storageError } = await supabase
       .storage.from('Lesson_Files')
       .upload(fileName, buffer, { contentType: mimeType, upsert: true })
@@ -79,9 +83,8 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
     if (storageError) return res.status(500).json({ error: storageError.message })
     console.log('[upload] ✅ Raw file saved.')
 
-    // Step 2: Run ingestion pipeline
     const result = await ingestDocument(buffer, fileName, fileType)
-    console.log(`[upload] ✅ Done. chunks=${result.chunkCount} images=${result.imageCount}`)
+    console.log(`[upload] ✅ chunks=${result.chunkCount} images=${result.imageCount}`)
 
     res.status(201).json({
       message: 'Document uploaded and processed successfully.',
@@ -89,13 +92,36 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
       chunk_count: result.chunkCount,
       image_count: result.imageCount,
     })
-
   } catch (err) {
     console.error('[upload] Error:', err.message)
     res.status(500).json({ error: err.message })
   }
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /chat  — ask a question, get answer from Claude
+// Body: { question: string, file_name?: string }
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/chat', async (req, res) => {
+  try {
+    const { question, file_name } = req.body
+    if (!question) return res.status(400).json({ error: 'question is required.' })
+
+    console.log(`[chat] Question: "${question}"`)
+    const result = await handleChat(question, file_name || null)
+    console.log(`[chat] ✅ Answered. sources=${result.sources.length} images=${result.images.length}`)
+
+    res.json(result)
+  } catch (err) {
+    console.error('[chat] Error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 app.listen(port, () => {
-  console.log(`\n🚀 Backend running on http://localhost:${port}\n`)
+  console.log(`\n🚀 notebookXL backend running on http://localhost:${port}`)
+  console.log(`   GET  /documents        — list files`)
+  console.log(`   POST /documents/upload — upload & ingest`)
+  console.log(`   POST /chat             — ask Claude\n`)
 })
