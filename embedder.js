@@ -1,52 +1,42 @@
 /**
  * embedder.js
- * Wraps OpenAI text-embedding-3-small with automatic batching.
+ * Creates OpenAI client lazily so dotenv is loaded first.
  */
 
-import OpenAI from 'openai';
+import OpenAI from 'openai'
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+let _openai = null
 
-const EMBED_MODEL = 'text-embedding-3-small';
-const BATCH_SIZE  = 100; // OpenAI limit per request
+function getClient() {
+  if (!_openai) {
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY environment variable is missing.')
+    }
+    _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  }
+  return _openai
+}
 
-/**
- * Embed an array of strings.
- * Returns float[][] in the same order as input.
- *
- * @param {string[]} texts
- * @returns {Promise<number[][]>}
- */
+const EMBED_MODEL = 'text-embedding-3-small'
+const BATCH_SIZE = 100
+
 export async function embedTexts(texts) {
-  const allEmbeddings = [];
+  const openai = getClient()
+  const allEmbeddings = []
 
   for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const batch = texts.slice(i, i + BATCH_SIZE);
-
-    const response = await openai.embeddings.create({
-      model: EMBED_MODEL,
-      input: batch,
-    });
-
-    // Preserve original order (OpenAI returns them indexed)
-    const sorted = response.data
-      .sort((a, b) => a.index - b.index)
-      .map(d => d.embedding);
-
-    allEmbeddings.push(...sorted);
+    const batch = texts.slice(i, i + BATCH_SIZE)
+    const response = await openai.embeddings.create({ model: EMBED_MODEL, input: batch })
+    const sorted = response.data.sort((a, b) => a.index - b.index).map(d => d.embedding)
+    allEmbeddings.push(...sorted)
   }
 
-  return allEmbeddings;
+  return allEmbeddings
 }
 
-/**
- * Embed a single string.
- * @param {string} text
- * @returns {Promise<number[]>}
- */
 export async function embedOne(text) {
-  const [embedding] = await embedTexts([text]);
-  return embedding;
+  const [embedding] = await embedTexts([text])
+  return embedding
 }
 
-export { openai };
+export { getClient as openai }
