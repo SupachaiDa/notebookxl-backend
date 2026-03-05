@@ -1,11 +1,21 @@
 /**
  * chat.js
- * Handles RAG chat: embed question → search lesson_chunk → answer with Claude
+ * Handles RAG chat: embed question → search lesson_chunk → answer with AI
+ *
+ * 🔧 TO CHANGE AI MODEL — only edit the CONFIG block below:
  */
 
-import Anthropic from '@anthropic-ai/sdk'
+import OpenAI from 'openai'
 import { createClient } from '@supabase/supabase-js'
 import { embedOne } from './embedder.js'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔧 CONFIG — change model here anytime
+// ─────────────────────────────────────────────────────────────────────────────
+const AI_MODEL = 'gpt-4o-mini'   // swap to 'gpt-4o' for smarter answers
+const AI_MAX_TOKENS = 1024
+const SEARCH_TOP_K = 5               // number of chunks to retrieve
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── Lazy clients ──────────────────────────────────────────────────────────────
 let _supabase = null
@@ -14,68 +24,64 @@ function getSupabase() {
   return _supabase
 }
 
-let _anthropic = null
-function getAnthropic() {
-  if (!_anthropic) _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  return _anthropic
+let _openai = null
+function getOpenAI() {
+  if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  return _openai
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main chat handler — call this from index.js route
+// Main chat handler
 // ─────────────────────────────────────────────────────────────────────────────
 export async function handleChat(question, fileName = null) {
   const supabase = getSupabase()
 
-  // 1. Embed the question using OpenAI
+  // 1. Embed the question
   const embedding = await embedOne(question)
 
   // 2. Search similar chunks via Supabase RPC
   const { data: chunks, error } = await supabase.rpc('match_lesson_chunks', {
     query_embedding: embedding,
-    match_count:     5,
-    filter_file:     fileName || null,
+    match_count: SEARCH_TOP_K,
+    filter_file: fileName || null,
   })
 
   if (error) throw new Error(`Vector search failed: ${error.message}`)
 
   if (!chunks || chunks.length === 0) {
     return {
-      answer:  "I couldn't find relevant information in the documents.",
-      images:  [],
+      answer: "I couldn't find relevant information in the documents.",
+      images: [],
       sources: [],
     }
   }
 
-  // 3. Build context block for Claude
+  // 3. Build context for the AI
   const context = chunks
     .map((c, i) => `[Source ${i + 1}] (${c.file_name})\n${c.content}`)
     .join('\n\n---\n\n')
 
-  // 4. Ask Claude
-  const anthropic = getAnthropic()
-  const message   = await anthropic.messages.create({
-    model:      'claude-haiku-4-5-20251001',
-    max_tokens: 1024,
+  // 4. Ask OpenAI
+  const openai = getOpenAI()
+  const completion = await openai.chat.completions.create({
+    model: AI_MODEL,
+    max_tokens: AI_MAX_TOKENS,
     messages: [
       {
-        role:    'user',
-        content: `You are a helpful assistant. Answer the question using ONLY the document excerpts below.
+        role: 'system',
+        content: `You are a helpful assistant. Answer questions using ONLY the document excerpts provided.
 - Cite [Source N] for each fact you use.
 - If the answer is not in the excerpts, say so clearly.
-- Never make up information.
-
-Document excerpts:
-
-${context}
-
----
-
-Question: ${question}`,
+- Never make up information.`,
+      },
+      {
+        role: 'user',
+        content: `Document excerpts:\n\n${context}\n\n---\n\nQuestion: ${question}`,
       }
     ]
   })
 
-  const answer = message.content[0].text
+  const answer = completion.choices[0].message.content
 
   // 5. Collect unique image URLs from matched chunks
   const images = [...new Set(
@@ -88,10 +94,10 @@ Question: ${question}`,
     answer,
     images,
     sources: chunks.map(c => ({
-      file_name:   c.file_name,
+      file_name: c.file_name,
       chunk_index: c.chunk_index,
-      similarity:  c.similarity,
-      preview:     c.content.slice(0, 150) + '…',
+      similarity: c.similarity,
+      preview: c.content.slice(0, 150) + '…',
     })),
   }
 }
