@@ -1,6 +1,6 @@
 /**
  * chat.js
- * RAG chat: load history → embed question → search chunks → answer with OpenAI
+ * RAG chat with optional image understanding via OpenAI Vision.
  *
  * 🔧 TO CHANGE AI MODEL — only edit the CONFIG block below:
  */
@@ -13,9 +13,10 @@ import { embedOne } from './embedder.js'
 // 🔧 CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
 const AI_MODEL        = 'gpt-4o-mini'
+const VISION_MODEL    = 'gpt-4o-mini'   // supports vision
 const AI_MAX_TOKENS   = 1024
 const SEARCH_TOP_K    = 5
-const HISTORY_LIMIT   = 10   // last N messages to include as context
+const HISTORY_LIMIT   = 10
 // ─────────────────────────────────────────────────────────────────────────────
 
 let _supabase = null
@@ -31,7 +32,36 @@ function getOpenAI() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Load recent chat history for a user (using service role key — bypasses RLS)
+// Describe an image using OpenAI Vision
+// imageBase64: base64 string (no data URI prefix)
+// mimeType: e.g. 'image/png', 'image/jpeg'
+// ─────────────────────────────────────────────────────────────────────────────
+async function describeImage(imageBase64, mimeType) {
+  const openai = getOpenAI()
+  const response = await openai.chat.completions.create({
+    model:      VISION_MODEL,
+    max_tokens: 512,
+    messages: [
+      {
+        role:    'user',
+        content: [
+          {
+            type:      'image_url',
+            image_url: { url: `data:${mimeType};base64,${imageBase64}` },
+          },
+          {
+            type: 'text',
+            text: 'Describe this image in detail. Include any text, numbers, charts, diagrams, people, objects, or notable content visible. Be thorough and factual.',
+          },
+        ],
+      }
+    ],
+  })
+  return response.choices[0].message.content
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Load recent chat history
 // ─────────────────────────────────────────────────────────────────────────────
 async function loadHistory(userId) {
   const supabase = getSupabase()
@@ -41,15 +71,12 @@ async function loadHistory(userId) {
     .eq('user_id', userId)
     .order('created_at', { ascending: false })
     .limit(HISTORY_LIMIT)
-
   if (error) throw new Error(`Failed to load history: ${error.message}`)
-
-  // Reverse so oldest first (correct order for OpenAI messages array)
   return (data || []).reverse()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Save a message to chat_messages
+// Save a message
 // ─────────────────────────────────────────────────────────────────────────────
 async function saveMessage(userId, role, content, imgUrls = []) {
   const supabase = getSupabase()
@@ -66,52 +93,74 @@ async function saveMessage(userId, role, content, imgUrls = []) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main chat handler
+// question     — what the user typed
+// userId       — for history
+// fileName     — optional file filter
+// imageBase64  — optional base64 image string (not stored, not shown to user)
+// imageMime    — e.g. 'image/png'
 // ─────────────────────────────────────────────────────────────────────────────
-export async function handleChat(question, userId, fileName = null) {
+export async function handleChat(question, userId, fileName = null, imageBase64 = null, imageMime = 'image/png') {
   const supabase = getSupabase()
 
-  // 1. Load chat history
+  // 1. If image provided, describe it first
+  let imageDescription = null
+  if (imageBase64) {
+    console.log('[chat] Describing uploaded image via Vision...')
+    imageDescription = await describeImage(imageBase64, imageMime)
+    console.log('[chat] Image description ready.')
+  }
+
+  // 2. Build the full question for embedding + context
+  //    (includes image description but user only sees their original question)
+  const fullQuestion = imageDescription
+    ? `${question}\n\n[The user also attached an image. Here is what the image shows: ${imageDescription}]`
+    : question
+
+  // 3. Load chat history
   const history = await loadHistory(userId)
 
-  // 2. Embed the question
-  const embedding = await embedOne(question)
+  // 4. Embed the full question (with image context if any)
+  const embedding = await embedOne(fullQuestion)
 
-  // 3. Search similar chunks
+  // 5. Search similar chunks
   const { data: chunks, error } = await supabase.rpc('match_lesson_chunks', {
     query_embedding: embedding,
     match_count:     SEARCH_TOP_K,
     filter_file:     fileName || null,
   })
-
   if (error) throw new Error(`Vector search failed: ${error.message}`)
 
-  // 4. Build context from chunks
+  // 6. Build document context
   const context = chunks && chunks.length > 0
     ? chunks.map((c, i) => `[Source ${i + 1}] (${c.file_name})\n${c.content}`).join('\n\n---\n\n')
     : 'No relevant document excerpts found.'
 
-  // 5. Build messages array for OpenAI:
-  //    system prompt + history + current question with context
+  // 7. Build messages for OpenAI
   const messages = [
     {
       role:    'system',
       content: `You are a helpful assistant for an e-learning platform.
 Answer questions using the document excerpts provided.
 - Cite [Source N] for each fact you use.
+- If the user attached an image, use the image description to understand their question better.
 - If the answer is not in the excerpts, say so clearly.
 - Use the conversation history to give contextual, smooth replies.
 - Never make up information.`,
     },
-    // Inject previous messages as conversation history
     ...history.map(m => ({ role: m.role, content: m.content })),
-    // Current question with retrieved context
     {
       role:    'user',
-      content: `Document excerpts:\n\n${context}\n\n---\n\nQuestion: ${question}`,
+      content: imageDescription
+        // If image was attached, send as multimodal content so AI understands both
+        ? [
+            { type: 'text', text: `Document excerpts:\n\n${context}\n\n---\n\nQuestion: ${question}` },
+            { type: 'image_url', image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
+          ]
+        : `Document excerpts:\n\n${context}\n\n---\n\nQuestion: ${question}`,
     },
   ]
 
-  // 6. Ask OpenAI
+  // 8. Ask OpenAI
   const openai     = getOpenAI()
   const completion = await openai.chat.completions.create({
     model:      AI_MODEL,
@@ -121,29 +170,25 @@ Answer questions using the document excerpts provided.
 
   const answer = completion.choices[0].message.content
 
-  // 7. Collect unique image URLs
+  // 9. Collect image URLs from matched chunks (document images, not user's uploaded image)
   const images = chunks && chunks.length > 0
     ? [...new Set(chunks.flatMap(c => c.img_url ? c.img_url.split(', ') : []).filter(Boolean))]
     : []
 
-  // 8. Save both messages to history
+  // 10. Save to history — store only the original question (not image description)
   await saveMessage(userId, 'user',      question, [])
   await saveMessage(userId, 'assistant', answer,   images)
 
-  return {
-    answer,
-    images,
-    sources: (chunks || []).map(c => ({
-      file_name:   c.file_name,
-      chunk_index: c.chunk_index,
-      similarity:  c.similarity,
-      preview:     c.content.slice(0, 150) + '…',
-    })),
-  }
+  return { answer, images, sources: (chunks || []).map(c => ({
+    file_name:   c.file_name,
+    chunk_index: c.chunk_index,
+    similarity:  c.similarity,
+    preview:     c.content.slice(0, 150) + '…',
+  })) }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Get full chat history for a user
+// Get full chat history
 // ─────────────────────────────────────────────────────────────────────────────
 export async function getChatHistory(userId) {
   const supabase = getSupabase()
@@ -152,7 +197,6 @@ export async function getChatHistory(userId) {
     .select('id, role, content, img_urls, created_at')
     .eq('user_id', userId)
     .order('created_at', { ascending: true })
-
   if (error) throw new Error(error.message)
   return data || []
 }

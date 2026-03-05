@@ -92,13 +92,22 @@ app.post('/documents/upload', verifyToken, isAdmin, upload.single('file'), async
 })
 
 // ── POST /chat — logged in users only ─────────────────────────────────────────
+// Body: { question, file_name?, image_base64?, image_mime? }
 app.post('/chat', verifyToken, async (req, res) => {
   try {
-    const { question, file_name } = req.body
+    const { question, file_name, image_base64, image_mime } = req.body
     if (!question) return res.status(400).json({ error: 'question is required.' })
 
-    console.log(`[chat] ${req.user.email}: "${question}"`)
-    const result = await handleChat(question, req.user.id, file_name || null)
+    const hasImage = !!image_base64
+    console.log(`[chat] ${req.user.email}: "${question}" ${hasImage ? '🖼️ +image' : ''}`)
+
+    const result = await handleChat(
+      question,
+      req.user.id,
+      file_name     || null,
+      image_base64  || null,
+      image_mime    || 'image/png'
+    )
 
     res.json(result)
   } catch (err) {
