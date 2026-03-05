@@ -7,7 +7,15 @@ import { ingestDocument } from './getdocfile.js'
 
 const app = express()
 const port = process.env.PORT || 3000
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+
+// ── Lazy Supabase client ──────────────────────────────────────────────────────
+let _supabase = null
+function getSupabase() {
+  if (!_supabase) {
+    _supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+  }
+  return _supabase
+}
 
 app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:8080' }))
 app.use(express.json())
@@ -24,9 +32,10 @@ const upload = multer({
 
 app.get('/', (_req, res) => res.json({ status: 'ok' }))
 
-// ── GET /documents — list raw files from Lesson_Files bucket ─────────────────
+// ── GET /documents — list files from Lesson_Files bucket ─────────────────────
 app.get('/documents', async (_req, res) => {
   try {
+    const supabase = getSupabase()
     const { data, error } = await supabase
       .storage
       .from('Lesson_Files')
@@ -34,13 +43,13 @@ app.get('/documents', async (_req, res) => {
 
     if (error) return res.status(500).json({ error: error.message })
 
-    const files = data
+    const files = (data || [])
       .filter(f => f.name !== '.emptyFolderPlaceholder')
       .map(f => ({
         name: f.name,
         size: f.metadata?.size || 0,
         created_at: f.created_at,
-        url: supabase.storage.from('Lesson_Files').getPublicUrl(f.name).data.publicUrl
+        url: supabase.storage.from('Lesson_Files').getPublicUrl(f.name).data.publicUrl,
       }))
 
     res.json({ files })
@@ -54,6 +63,7 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file received.' })
 
+    const supabase = getSupabase()
     const fileName = req.file.originalname
     const fileType = fileName.split('.').pop().toLowerCase()
     const buffer = req.file.buffer
@@ -63,8 +73,7 @@ app.post('/documents/upload', upload.single('file'), async (req, res) => {
 
     // Step 1: Save raw file to Lesson_Files bucket
     const { error: storageError } = await supabase
-      .storage
-      .from('Lesson_Files')
+      .storage.from('Lesson_Files')
       .upload(fileName, buffer, { contentType: mimeType, upsert: true })
 
     if (storageError) return res.status(500).json({ error: storageError.message })
