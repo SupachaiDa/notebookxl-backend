@@ -187,44 +187,30 @@ Answer questions using the document excerpts provided.
     }
   }
 
-  // 9a. For each unique document image, run Vision to get an accurate description,
-  //     then merge with the closest chunk context for a richer caption.
-  for (const [url, meta] of imageMap.entries()) {
+  // 9a. Generate a caption for each image using its closest chunk context.
+  //     We use GPT to turn the raw chunk text into a clean 1-2 sentence caption.
+  //     No image fetch needed — the chunk text is already the most relevant context.
+  await Promise.all([...imageMap.entries()].map(async ([url, meta]) => {
     try {
-      // Fetch the image from Supabase Storage as base64
-      const imgRes    = await fetch(url)
-      const arrayBuf  = await imgRes.arrayBuffer()
-      const b64       = Buffer.from(arrayBuf).toString('base64')
-      const mime      = imgRes.headers.get('content-type') || 'image/png'
-
-      // Get raw vision description
-      const rawVision = await describeImage(b64, mime)
-
-      // Merge: ask GPT to write a single concise caption combining Vision + chunk context
       const captionRes = await getOpenAI().chat.completions.create({
         model:      AI_MODEL,
-        max_tokens: 150,
+        max_tokens: 100,
         messages: [{
           role:    'user',
-          content: `You are writing an image caption for an e-learning document.
-Use the image description and the related document text below to write ONE clear, concise caption (1–2 sentences max).
-The caption should help a student understand what the image shows and why it matters in context.
-
-Image description: ${rawVision}
-
-Related document text: ${meta.chunk_context.slice(0, 400)}
-
-Respond with the caption only. No preamble.`,
+          content: `Write a concise 1-sentence image caption for a student based on this document text.
+The caption should describe what the image likely shows and why it matters.
+Document text: ${meta.chunk_context.slice(0, 500)}
+Respond with the caption only. No preamble, no quotes.`,
         }]
       })
-
       meta.vision_description = captionRes.choices[0].message.content.trim()
+      console.log(`[chat] Caption OK for image in chunk`)
     } catch (err) {
-      // If fetch or Vision fails for an image, fall back to a short chunk summary
-      console.warn(`[chat] Caption generation failed for ${url}:`, err.message)
-      meta.vision_description = meta.chunk_context.slice(0, 120) + '…'
+      console.warn(`[chat] Caption failed:`, err.message)
+      // Fallback: clean up the chunk text itself as the caption
+      meta.vision_description = meta.chunk_context.replace(/\s+/g, ' ').slice(0, 150).trim() + '…'
     }
-  }
+  }))
 
   const images             = [...imageMap.keys()]
   const image_descriptions = Object.fromEntries(
