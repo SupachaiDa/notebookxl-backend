@@ -171,20 +171,81 @@ Answer questions using the document excerpts provided.
   const answer = completion.choices[0].message.content
 
   // 9. Collect image URLs from matched chunks (document images, not user's uploaded image)
-  const images = chunks && chunks.length > 0
-    ? [...new Set(chunks.flatMap(c => c.img_url ? c.img_url.split(', ') : []).filter(Boolean))]
-    : []
+  //    Build a map: url → { chunkText, visionDescription }
+  const imageMap = new Map() // url → { chunk_context, vision_description }
+
+  if (chunks && chunks.length > 0) {
+    for (const chunk of chunks) {
+      if (!chunk.img_url) continue
+      const urls = chunk.img_url.split(', ').map(u => u.trim()).filter(Boolean)
+      for (const url of urls) {
+        if (!imageMap.has(url)) {
+          // Use the chunk text that is most closely associated with this image as context
+          imageMap.set(url, { chunk_context: chunk.content, vision_description: null })
+        }
+      }
+    }
+  }
+
+  // 9a. For each unique document image, run Vision to get an accurate description,
+  //     then merge with the closest chunk context for a richer caption.
+  for (const [url, meta] of imageMap.entries()) {
+    try {
+      // Fetch the image from Supabase Storage as base64
+      const imgRes    = await fetch(url)
+      const arrayBuf  = await imgRes.arrayBuffer()
+      const b64       = Buffer.from(arrayBuf).toString('base64')
+      const mime      = imgRes.headers.get('content-type') || 'image/png'
+
+      // Get raw vision description
+      const rawVision = await describeImage(b64, mime)
+
+      // Merge: ask GPT to write a single concise caption combining Vision + chunk context
+      const captionRes = await getOpenAI().chat.completions.create({
+        model:      AI_MODEL,
+        max_tokens: 150,
+        messages: [{
+          role:    'user',
+          content: `You are writing an image caption for an e-learning document.
+Use the image description and the related document text below to write ONE clear, concise caption (1–2 sentences max).
+The caption should help a student understand what the image shows and why it matters in context.
+
+Image description: ${rawVision}
+
+Related document text: ${meta.chunk_context.slice(0, 400)}
+
+Respond with the caption only. No preamble.`,
+        }]
+      })
+
+      meta.vision_description = captionRes.choices[0].message.content.trim()
+    } catch (err) {
+      // If fetch or Vision fails for an image, fall back to a short chunk summary
+      console.warn(`[chat] Caption generation failed for ${url}:`, err.message)
+      meta.vision_description = meta.chunk_context.slice(0, 120) + '…'
+    }
+  }
+
+  const images             = [...imageMap.keys()]
+  const image_descriptions = Object.fromEntries(
+    [...imageMap.entries()].map(([url, meta]) => [url, meta.vision_description])
+  )
 
   // 10. Save to history — store only the original question (not image description)
   await saveMessage(userId, 'user',      question, [])
   await saveMessage(userId, 'assistant', answer,   images)
 
-  return { answer, images, sources: (chunks || []).map(c => ({
-    file_name:   c.file_name,
-    chunk_index: c.chunk_index,
-    similarity:  c.similarity,
-    preview:     c.content.slice(0, 150) + '…',
-  })) }
+  return {
+    answer,
+    images,
+    image_descriptions, // { [url]: "caption string" }
+    sources: (chunks || []).map(c => ({
+      file_name:   c.file_name,
+      chunk_index: c.chunk_index,
+      similarity:  c.similarity,
+      preview:     c.content.slice(0, 150) + '…',
+    }))
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
